@@ -87,13 +87,13 @@
 
 /* --- Periodos y capacidades --------------------------------------------- */
 #define SENSOR_PERIODO_MS       500
-#define INTERFAZ_PERIODO_MS     250
+#define INTERFAZ_PERIODO_MS     500
 #define INFORME_PERIODO_MS      10000
 
 #define UMBRAL_INICIAL_X100     4500
 #define UMBRAL_ALTO_X100        5000
 #define UMBRAL_BAJO_X100        4000
-#define Histeresis_X100           200
+
 #define PARPADEO_ALARMA_MS      250 //para prender y apagar, cada estado dura la mitad
 #define EVENTOS_MAX              5
 
@@ -202,6 +202,7 @@ static touch_sensor_handle_t s_touch;
 static void callback_parpadeo(TimerHandle_t timer)
 {
     s_parpadeo_alarma = !s_parpadeo_alarma;
+    xTaskNotifyGive(s_tarea_interfaz);
 }
 
 /* Contadores de diagnóstico. Los escribe una sola tarea cada uno. */
@@ -399,11 +400,15 @@ static void tarea_proceso(void *arg)
             s_estado.alarma = true;
             s_estado.alarmas++;
 
+            xTimerStart(s_timer_parpadeo, 0);
+
             enviar_evento(EVENTO_ALARMA, 1);
 
         } else if (s_estado.alarma &&
-           media < s_estado.umbral_x100 - Histeresis_X100) {
+           media < s_estado.umbral_x100 - HISTERESIS_X100) {
             s_estado.alarma = false;
+
+            xTimerStop(s_timer_parpadeo, 0);
 
             enviar_evento(EVENTO_ALARMA, 0);
         }
@@ -514,13 +519,11 @@ static void tarea_interfaz(void *arg)
         /* El LED como termómetro: azul frío, verde templado, rojo caliente.
          * En MODO_SILENCIO se apaga, para poder mirar el consumo. */
         if (e.alarma) {
-            led_alarma_encendido = !led_alarma_encendido;
-
-            if (led_alarma_encendido) {
-                led(24, 0, 0);
-            } else {
-                led(0, 0, 0);
-            }
+        if (s_parpadeo_alarma) {
+            led(24, 0, 0);
+        } else {
+            led(0, 0, 0);
+        }
         } else if (e.modo == MODO_SILENCIO) {
             ESP_ERROR_CHECK(led_strip_clear(s_led));
         } else if (e.media_x100 < 3000) {
@@ -553,6 +556,7 @@ static void tarea_carga(void *arg)
         xSemaphoreGive(s_mutex_estado);
 
         if (activa) {
+            ///* TAREA carga: atiende la carga */
             for (volatile uint32_t i = 0; i < 100000; i++) {
                 basura = basura * 1664525u + 1013904223u;
             }
@@ -783,6 +787,12 @@ void app_main(void)
     );
 
     ESP_ERROR_CHECK(s_timer_parpadeo != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+
+    ESP_ERROR_CHECK(
+        xTimerStart(s_timer_parpadeo, pdMS_TO_TICKS(100)) == pdPASS
+        ? ESP_OK
+        : ESP_FAIL
+    );
 
     ESP_ERROR_CHECK((s_cola_muestras && s_cola_toques &&
                      s_mutex_estado && s_sem_arranque) ? ESP_OK : ESP_ERR_NO_MEM);
