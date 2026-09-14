@@ -1,0 +1,18 @@
+# Valores por defecto de este ejemplo. idf.py los aplica al crear el
+# sdkconfig; para cambiarlos después, `idf.py menuconfig` o borrar sdkconfig.
+
+# Tick de 1 ms en vez de los 10 ms por defecto. Con 100 Hz, el retraso mínimo
+# de una tarea es de 10 ms y el jitter del sensor no baja de ahí: la
+# resolución temporal de TODO el sistema es el tick. Subirlo cuesta más
+# interrupciones de reloj (y algo de consumo); es el compromiso clásico.
+CONFIG_FREERTOS_HZ=1000
+
+# Habilita uxTaskGetSystemState()/vTaskList(), que es lo que permite ver el
+# estado y la pila de cada tarea en tiempo de ejecución. Cuesta unos bytes por
+# tarea; en producción se suele dejar apagado.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# Avisa por consola si una tarea desborda su pila, en lugar de reiniciar sin
+# explicación. En un ejemplo donde se ajustan pilas a mano, es imprescindible.
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
