@@ -73,6 +73,7 @@
 #define PRIO_INTERFAZ           3    /* refresco visual: puede esperar       */
 #define PRIO_CARGA              2    //no tiene ningún plazo funcional, porque su único objetivo es generar carga térmica 
 #define PILA_CARGA              2048
+#define PRIO_REGISTRO           4
 
 /* --- Tamaños de pila, en BYTES (ESP-IDF; en FreeRTOS puro son palabras) ---
  *
@@ -82,6 +83,7 @@
 #define PILA_SENSOR             3072
 #define PILA_PROCESO            3072
 #define PILA_INTERFAZ           4096
+#define PILA_REGISTRO           3072
 
 /* --- Periodos y capacidades --------------------------------------------- */
 #define SENSOR_PERIODO_MS       500
@@ -91,13 +93,15 @@
 #define UMBRAL_INICIAL_X100     4500
 #define UMBRAL_ALTO_X100        5000
 #define UMBRAL_BAJO_X100        4000
-#define HISTESIS_X100         200
+#define Histeresis_X100           200
 #define PARPADEO_ALARMA_MS      250 //para prender y apagar, cada estado dura la mitad
 #define EVENTOS_MAX              5
 
 #define COLA_MUESTRAS_LARGO     8     /* amortigua ráfagas: 4 s de holgura   */
 #define COLA_TOQUES_LARGO       16
 #define VENTANA_MEDIA           8     /* muestras de la media móvil          */
+
+#define COLA_EVENTOS_LARGO      16
 
 /* --- Calibración del táctil (igual que en las Clases 2 y 3) -------------- */
 #define BARRIDOS_CALIBRACION    3
@@ -152,6 +156,19 @@ typedef struct {
     uint32_t alarmas;
 } estado_t;
 
+typedef enum {
+    EVENTO_TOQUE,
+    EVENTO_CARGA,
+    EVENTO_UMBRAL,
+    EVENTO_ALARMA
+} tipo_evento_t;
+
+typedef struct {
+    tipo_evento_t tipo;
+    int64_t marca_us;
+    int32_t valor;
+} evento_t;
+
 /* ======================================================================== */
 /*  Objetos del kernel                                                       */
 /* ======================================================================== */
@@ -163,6 +180,7 @@ static SemaphoreHandle_t s_sem_arranque;   /* aviso de "ya estoy listo"     */
 static TimerHandle_t     s_timer_informe;  /* temporizador software         */
 static TaskHandle_t      s_tarea_interfaz; /* destino de las notificaciones */
 static TaskHandle_t      s_tarea_carga;    // handle de la carga 
+static QueueHandle_t     s_cola_eventos;
 
 static estado_t s_estado = {
     .minima_x100 = INT32_MAX,
@@ -218,6 +236,17 @@ static void formatear_temp(char *dst, size_t n, int32_t x100)
 
     snprintf(dst, n, "%s%" PRId32 ",%02" PRId32,
              signo, abs_x100 / 100, abs_x100 % 100);
+}
+
+static void enviar_evento(tipo_evento_t tipo, int32_t valor)
+{
+    const evento_t evento = {
+        .tipo = tipo,
+        .marca_us = esp_timer_get_time(),
+        .valor = valor,
+    };
+
+    xQueueSend(s_cola_eventos, &evento, 0);
 }
 
 /* ======================================================================== */
@@ -358,9 +387,14 @@ static void tarea_proceso(void *arg)
         if (!s_estado.alarma && media > s_estado.umbral_x100) {
             s_estado.alarma = true;
             s_estado.alarmas++;
+
+            enviar_evento(EVENTO_ALARMA, 1);
+
         } else if (s_estado.alarma &&
-            media < s_estado.umbral_x100 - HISTESIS_X100) {
+           media < s_estado.umbral_x100 - Histeresis_X100) {
             s_estado.alarma = false;
+
+            enviar_evento(EVENTO_ALARMA, 0);
         }
 
 
@@ -373,33 +407,6 @@ static void tarea_proceso(void *arg)
         xTaskNotifyGive(s_tarea_interfaz);
     }
 }
-
-/* ======================================================================== */
-/*  TAREA — carga:  atiende la carga             */
-/* ======================================================================== */
-
-
-static void tarea_carga(void *arg)
-{
-    volatile uint32_t basura = 0;
-
-    while (1) {
-        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
-        const bool activa = s_estado.carga_activa;
-        xSemaphoreGive(s_mutex_estado);
-
-        if (activa) {
-            for (volatile uint32_t i = 0; i < 100000; i++) {
-                basura = basura * 1664525u + 1013904223u;
-            }
-
-            taskYIELD();   // ← ESTA ES LA CLAVE
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-}
-
 
 
 /* ======================================================================== */
@@ -414,6 +421,8 @@ static void tarea_tactil(void *arg)
 
     while (xQueueReceive(s_cola_toques, &ev, portMAX_DELAY) == pdTRUE) {
         const int canal = ev.canal;
+        enviar_evento(EVENTO_TOQUE, canal);
+
         const int64_t latencia = esp_timer_get_time() - ev.marca_us;
 
         const char *nombre = "?";
@@ -427,7 +436,10 @@ static void tarea_tactil(void *arg)
         s_estado.toques++;
         if (canal == BOTONES[0].canal) {                 /* PLAY */
             s_estado.carga_activa = !s_estado.carga_activa;
-        }
+
+            enviar_evento(EVENTO_CARGA,
+                  s_estado.carga_activa ? 1 : 0);
+
         } else if (canal == BOTONES[1].canal) {          /* VOL_UP */
             if (s_estado.umbral_x100 == UMBRAL_INICIAL_X100) {
                 s_estado.umbral_x100 = UMBRAL_ALTO_X100;
@@ -436,6 +448,7 @@ static void tarea_tactil(void *arg)
             } else {
                 s_estado.umbral_x100 = UMBRAL_INICIAL_X100;
             }
+            enviar_evento(EVENTO_UMBRAL, s_estado.umbral_x100);
         }
         const modo_t modo = s_estado.modo;
         xSemaphoreGive(s_mutex_estado);
@@ -502,6 +515,69 @@ static void tarea_interfaz(void *arg)
                       "| n=%" PRIu32 "  toques=%" PRIu32 "  modo=%s",
                  buf_ult, buf_med, buf_min, buf_max,
                  e.muestras, e.toques, NOMBRE_MODO[e.modo]);
+    }
+}
+
+/* ======================================================================== */
+/*  TAREA — carga:  atiende la carga             */
+/* ======================================================================== */
+
+
+static void tarea_carga(void *arg)
+{
+    volatile uint32_t basura = 0;
+
+    while (1) {
+        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        const bool activa = s_estado.carga_activa;
+        xSemaphoreGive(s_mutex_estado);
+
+        if (activa) {
+            for (volatile uint32_t i = 0; i < 100000; i++) {
+                basura = basura * 1664525u + 1013904223u;
+            }
+
+            taskYIELD();   // ← ESTA ES LA CLAVE
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+
+/* ======================================================================== */
+/*  TAREA — registro:  atiende los toques diferidos de la ISR                */
+/* ======================================================================== */
+
+static void tarea_registro(void *arg)
+{
+    evento_t evento;
+
+    while (1) {
+        if (xQueueReceive(s_cola_eventos, &evento, portMAX_DELAY) == pdTRUE) {
+
+            switch (evento.tipo) {
+            case EVENTO_TOQUE:
+                ESP_LOGI(TAG, "[registro] TOQUE T%" PRId32,
+                         evento.valor);
+                break;
+
+            case EVENTO_CARGA:
+                ESP_LOGI(TAG, "[registro] CARGA %s",
+                         evento.valor ? "ON" : "OFF");
+                break;
+
+            case EVENTO_UMBRAL:
+                ESP_LOGI(TAG, "[registro] UMBRAL %" PRId32 " C",
+                         evento.valor / 100);
+                break;
+
+            case EVENTO_ALARMA:
+                ESP_LOGI(TAG, "[registro] ALARMA %s",
+                         evento.valor ? "ON" : "OFF");
+                break;
+            }
+        }
     }
 }
 
@@ -680,11 +756,20 @@ void app_main(void)
     s_mutex_estado  = xSemaphoreCreateMutex();
     s_sem_arranque  = xSemaphoreCreateBinary();
 
+    s_cola_eventos = xQueueCreate(COLA_EVENTOS_LARGO, sizeof(evento_t));
+
+
     ESP_ERROR_CHECK((s_cola_muestras && s_cola_toques &&
                      s_mutex_estado && s_sem_arranque) ? ESP_OK : ESP_ERR_NO_MEM);
 
     /* La cola de toques debe existir antes de habilitar la interrupción. */
     configurar_tactil();
+
+    ESP_ERROR_CHECK((s_cola_muestras && s_cola_toques &&
+                 s_cola_eventos &&
+                 s_mutex_estado && s_sem_arranque)
+                ? ESP_OK : ESP_ERR_NO_MEM);
+
 
     /* --- Las tareas ------------------------------------------------------
      *
@@ -699,6 +784,7 @@ void app_main(void)
                 &s_tarea_interfaz);
     xTaskCreate(tarea_carga, "carga", PILA_CARGA, NULL,
             PRIO_CARGA, &s_tarea_carga);
+    xTaskCreate(tarea_registro, "registro", PILA_REGISTRO, NULL, PRIO_REGISTRO,NULL);
 
     /* --- El temporizador software ----------------------------------------
      *
