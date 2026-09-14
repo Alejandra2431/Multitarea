@@ -198,6 +198,7 @@ static estado_t s_estado = {
 static led_strip_handle_t s_led;
 static temperature_sensor_handle_t s_tsens;
 static touch_sensor_handle_t s_touch;
+static volatile bool s_parpadeo_alarma = false;
 
 static void callback_parpadeo(TimerHandle_t timer)
 {
@@ -206,8 +207,28 @@ static void callback_parpadeo(TimerHandle_t timer)
 }
 
 /* Contadores de diagnóstico. Los escribe una sola tarea cada uno. */
-static uint32_t s_perdidas_cola;    /* muestras que no cupieron en la cola  */
-static uint32_t s_jitter_max_us;    /* peor desviación del periodo del sensor */
+static uint32_t s_perdidas_cola = 0;
+static uint32_t s_perdidas_eventos = 0;
+static uint32_t s_perdidos_toques = 0;
+
+typedef struct {
+    uint32_t n;
+    uint64_t suma_us;
+    uint32_t max_us;
+} estadistica_jitter_t;
+
+static estadistica_jitter_t s_jitter_off = {0};
+static estadistica_jitter_t s_jitter_on  = {0};
+
+static int64_t s_anterior_muestra_us = 0;
+
+typedef struct {
+    uint32_t n;
+    uint64_t suma_us;
+    uint32_t min_us;
+    uint32_t max_us;
+} estadistica_latencia_t;
+
 
 /* ======================================================================== */
 /*  Botones táctiles                                                         */
@@ -226,6 +247,8 @@ static const boton_t BOTONES[] = {
 #define BOTONES_N   (sizeof(BOTONES) / sizeof(BOTONES[0]))
 
 static touch_channel_handle_t s_canales[BOTONES_N];
+static estadistica_latencia_t s_latencia_off[BOTONES_N] = {0};
+static estadistica_latencia_t s_latencia_on[BOTONES_N] = {0};
 
 /* ======================================================================== */
 /*  Utilidades                                                               */
@@ -256,10 +279,11 @@ static void enviar_evento(tipo_evento_t tipo, int32_t valor)
         .valor = valor,
     };
 
-    xQueueSend(s_cola_eventos, &evento, 0);
+    if (xQueueSend(s_cola_eventos, &evento, 0) != pdTRUE) {
+        s_perdidas_eventos++;
+    }
 }
 
-static volatile bool s_parpadeo_alarma = false;
 
 /* ======================================================================== */
 /*  ISR del táctil                                                           */
@@ -277,7 +301,9 @@ static bool IRAM_ATTR al_tocar(touch_sensor_handle_t sensor,
     const toque_t t = { .canal = ev->chan_id,
                         .marca_us = esp_timer_get_time() };
 
-    xQueueSendFromISR(s_cola_toques, &t, &hp_task_woken);
+    if (xQueueSendFromISR(s_cola_toques, &t, &hp_task_woken) != pdTRUE) {
+        s_perdidos_toques++;
+    }
 
     /* Devolver true equivale a portYIELD_FROM_ISR(): al salir de la ISR el
      * planificador entra de inmediato, en vez de esperar al siguiente tick.
@@ -296,7 +322,6 @@ static void tarea_sensor(void *arg)
 {
     TickType_t anterior = xTaskGetTickCount();
     uint32_t secuencia = 0;
-    int64_t esperado_us = esp_timer_get_time();
 
     /* Espera a que la interfaz esté lista antes de empezar a producir. Un
      * semáforo binario usado como "señal de una sola vez". */
@@ -322,36 +347,58 @@ static void tarea_sensor(void *arg)
             .secuencia = secuencia++,
         };
 
-        /* Con xTicksToWait = 0 la tarea NO se bloquea si la cola está llena:
-         * prefiere perder una muestra a retrasarse. Es una decisión de
-         * diseño, y se cuenta lo que se pierde para poder justificarla. */
-        if (xQueueSend(s_cola_muestras, &m, 0) != pdTRUE) {
-            s_perdidas_cola++;
-            ESP_LOGW(TAG, "[sensor] cola llena, muestra %" PRIu32 " perdida",
-                     m.secuencia);
-        }
+        bool carga_activa;
 
-        /* Jitter: cuánto se desvía el despertar real del periodo teórico. Es
-         * la medida de si el sistema cumple sus plazos. */
-        esperado_us += (int64_t)SENSOR_PERIODO_MS * 1000;
-        const int64_t desvio = m.marca_us - esperado_us;
-        const uint32_t abs_desvio = (uint32_t)((desvio < 0) ? -desvio : desvio);
-        if (abs_desvio > s_jitter_max_us) {
-            s_jitter_max_us = abs_desvio;
-        }
-
-        /* xTaskDelayUntil mide el periodo desde el despertar ANTERIOR, no
-         * desde ahora. vTaskDelay() acumularía el tiempo del cuerpo del
-         * bucle y el periodo se iría deslizando. */
-        /* El modo lo escribe la tarea del táctil: leerlo sin el mutex sería
-         * una carrera, aunque sea un solo enum. Barato y correcto es mejor
-         * que barato. */
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        carga_activa = s_estado.carga_activa;
         const modo_t modo = s_estado.modo;
         xSemaphoreGive(s_mutex_estado);
 
-        const uint32_t periodo = (modo == MODO_RAPIDO) ? SENSOR_PERIODO_MS / 2
-                                                       : SENSOR_PERIODO_MS;
+        const uint32_t periodo =
+            (modo == MODO_RAPIDO) ? SENSOR_PERIODO_MS / 2
+                              : SENSOR_PERIODO_MS;
+
+        if (s_anterior_muestra_us != 0) {
+            const int64_t periodo_real =
+                m.marca_us - s_anterior_muestra_us;
+
+            const int64_t periodo_esperado =
+                (int64_t)periodo * 1000;
+
+            const int64_t error =
+                periodo_real - periodo_esperado;
+
+            const uint32_t abs_error =
+                (uint32_t)((error < 0) ? -error : error);
+
+            estadistica_jitter_t *j =
+                carga_activa ? &s_jitter_on : &s_jitter_off;
+
+            j->n++;
+            j->suma_us += abs_error;
+
+            if (abs_error > j->max_us) {
+                j->max_us = abs_error;
+        }
+    }
+
+    s_anterior_muestra_us = m.marca_us;
+
+
+    /* Con xTicksToWait = 0 la tarea NO se bloquea si la cola está llena:
+     * prefiere perder una muestra a retrasarse. Es una decisión de
+      * diseño, y se cuenta lo que se pierde para poder justificarla. */
+    if (xQueueSend(s_cola_muestras, &m, 0) != pdTRUE) {
+        s_perdidas_cola++;
+            ESP_LOGW(TAG, "[sensor] cola llena, muestra %" PRIu32 " perdida",
+                 m.secuencia);
+        }
+
+
+        /* xTaskDelayUntil mide el periodo desde el despertar ANTERIOR, no
+         * desde ahora.Así el periodo no se va desplazando por el tiempo de ejecución
+        * del cuerpo del bucle. */
+
         xTaskDelayUntil(&anterior, pdMS_TO_TICKS(periodo));
     }
 }
@@ -439,7 +486,33 @@ static void tarea_tactil(void *arg)
         const int canal = ev.canal;
         enviar_evento(EVENTO_TOQUE, canal);
 
-        const int64_t latencia = esp_timer_get_time() - ev.marca_us;
+        const uint32_t latencia =
+    (uint32_t)(esp_timer_get_time() - ev.marca_us);
+
+    bool carga_activa;
+
+    xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+    carga_activa = s_estado.carga_activa;
+    xSemaphoreGive(s_mutex_estado);
+
+    for (size_t i = 0; i < BOTONES_N; i++) {
+        if (BOTONES[i].canal == canal) {
+            estadistica_latencia_t *s =
+                carga_activa ? &s_latencia_on[i]
+                             : &s_latencia_off[i];
+
+            s->n++;
+            s->suma_us += latencia;
+
+            if (s->n == 1 || latencia < s->min_us)
+                s->min_us = latencia;
+
+            if (latencia > s->max_us)
+                s->max_us = latencia;
+
+            break;
+        }
+    }
 
         const char *nombre = "?";
         for (size_t i = 0; i < BOTONES_N; i++) {
@@ -477,7 +550,7 @@ static void tarea_tactil(void *arg)
         }
 
         ESP_LOGI(TAG, "[tactil] %s (T%d) -> modo %s  "
-                      "| latencia ISR->tarea %" PRId64 " us",
+                      "| latencia ISR->tarea %" PRIu32 " us",
                  nombre, canal, NOMBRE_MODO[modo], latencia);
     }
 }
@@ -627,7 +700,7 @@ static const char *nombre_estado(eTaskState s)
  * temporizadores del sistema. Por eso este callback solo lee y escribe. */
 static void informe_de_tareas(TimerHandle_t t)
 {
-    static const char *TAREAS[] = { "tactil", "sensor", "proceso", "interfaz", "carga" };
+    static const char *TAREAS[] = { "tactil", "sensor", "proceso", "interfaz", "carga", "registro" };
 
     ESP_LOGI(TAG, "--- Informe de tareas (cada %d s) ------------------------",
              INFORME_PERIODO_MS / 1000);
@@ -651,10 +724,48 @@ static void informe_de_tareas(TimerHandle_t t)
     ESP_LOGI(TAG, "  cola de muestras: %u/%d llenas, %" PRIu32 " perdidas",
              (unsigned)uxQueueMessagesWaiting(s_cola_muestras),
              COLA_MUESTRAS_LARGO, s_perdidas_cola);
-    ESP_LOGI(TAG, "  jitter maximo del sensor: %" PRIu32 " us  "
-                  "(periodo %d ms, tick %d ms)",
-             s_jitter_max_us, SENSOR_PERIODO_MS,
-             (int)(1000 / configTICK_RATE_HZ));
+    ESP_LOGI(TAG, "  JITTER SENSOR OFF: n=%" PRIu32
+              " avg=%" PRIu32 " us max=%" PRIu32 " us",
+         s_jitter_off.n,
+         s_jitter_off.n ?
+             (uint32_t)(s_jitter_off.suma_us / s_jitter_off.n) : 0,
+         s_jitter_off.max_us);
+
+    ESP_LOGI(TAG, "  JITTER SENSOR ON : n=%" PRIu32
+              " avg=%" PRIu32 " us max=%" PRIu32 " us",
+             s_jitter_on.n,
+             s_jitter_on.n ?
+                 (uint32_t)(s_jitter_on.suma_us / s_jitter_on.n) : 0,
+            s_jitter_on.max_us);
+
+    for (size_t i = 0; i < BOTONES_N; i++) {
+        ESP_LOGI(TAG,
+             "  LAT OFF %-8s n=%" PRIu32
+             " avg=%" PRIu32 " min=%" PRIu32 " max=%" PRIu32 " us",
+             BOTONES[i].nombre,
+             s_latencia_off[i].n,
+             s_latencia_off[i].n ?
+                (uint32_t)(s_latencia_off[i].suma_us /
+                           s_latencia_off[i].n) : 0,
+             s_latencia_off[i].min_us,
+             s_latencia_off[i].max_us);
+
+        ESP_LOGI(TAG,
+             "  LAT ON  %-8s n=%" PRIu32
+             " avg=%" PRIu32 " min=%" PRIu32 " max=%" PRIu32 " us",
+             BOTONES[i].nombre,
+             s_latencia_on[i].n,
+             s_latencia_on[i].n ?
+                (uint32_t)(s_latencia_on[i].suma_us /
+                           s_latencia_on[i].n) : 0,
+             s_latencia_on[i].min_us,
+             s_latencia_on[i].max_us);
+    }
+
+    ESP_LOGI(TAG, "  perdidas eventos: %" PRIu32
+              " | perdidos toques: %" PRIu32,
+         s_perdidas_eventos, s_perdidos_toques);
+
     ESP_LOGI(TAG, "  heap libre: %" PRIu32 " B  (minimo historico %" PRIu32 " B)",
              (uint32_t)esp_get_free_heap_size(),
              (uint32_t)esp_get_minimum_free_heap_size());
@@ -788,11 +899,6 @@ void app_main(void)
 
     ESP_ERROR_CHECK(s_timer_parpadeo != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
-    ESP_ERROR_CHECK(
-        xTimerStart(s_timer_parpadeo, pdMS_TO_TICKS(100)) == pdPASS
-        ? ESP_OK
-        : ESP_FAIL
-    );
 
     ESP_ERROR_CHECK((s_cola_muestras && s_cola_toques &&
                      s_mutex_estado && s_sem_arranque) ? ESP_OK : ESP_ERR_NO_MEM);
