@@ -87,7 +87,7 @@
 
 /* --- Periodos y capacidades --------------------------------------------- */
 #define SENSOR_PERIODO_MS       500
-#define INTERFAZ_PERIODO_MS     1000
+#define INTERFAZ_PERIODO_MS     250
 #define INFORME_PERIODO_MS      10000
 
 #define UMBRAL_INICIAL_X100     4500
@@ -102,6 +102,9 @@
 #define VENTANA_MEDIA           8     /* muestras de la media móvil          */
 
 #define COLA_EVENTOS_LARGO      16
+
+#define HISTERESIS_X100          200
+
 
 /* --- Calibración del táctil (igual que en las Clases 2 y 3) -------------- */
 #define BARRIDOS_CALIBRACION    3
@@ -181,6 +184,7 @@ static TimerHandle_t     s_timer_informe;  /* temporizador software         */
 static TaskHandle_t      s_tarea_interfaz; /* destino de las notificaciones */
 static TaskHandle_t      s_tarea_carga;    // handle de la carga 
 static QueueHandle_t     s_cola_eventos;
+static TimerHandle_t s_timer_parpadeo;
 
 static estado_t s_estado = {
     .minima_x100 = INT32_MAX,
@@ -194,6 +198,11 @@ static estado_t s_estado = {
 static led_strip_handle_t s_led;
 static temperature_sensor_handle_t s_tsens;
 static touch_sensor_handle_t s_touch;
+
+static void callback_parpadeo(TimerHandle_t timer)
+{
+    s_parpadeo_alarma = !s_parpadeo_alarma;
+}
 
 /* Contadores de diagnóstico. Los escribe una sola tarea cada uno. */
 static uint32_t s_perdidas_cola;    /* muestras que no cupieron en la cola  */
@@ -248,6 +257,8 @@ static void enviar_evento(tipo_evento_t tipo, int32_t valor)
 
     xQueueSend(s_cola_eventos, &evento, 0);
 }
+
+static volatile bool s_parpadeo_alarma = false;
 
 /* ======================================================================== */
 /*  ISR del táctil                                                           */
@@ -476,7 +487,8 @@ static void tarea_tactil(void *arg)
 static void tarea_interfaz(void *arg)
 {
     char buf_ult[16], buf_med[16], buf_min[16], buf_max[16];
-
+    bool led_alarma_encendido = false;
+    
     /* Ya estamos listos: liberamos al sensor. */
     xSemaphoreGive(s_sem_arranque);
 
@@ -501,7 +513,15 @@ static void tarea_interfaz(void *arg)
 
         /* El LED como termómetro: azul frío, verde templado, rojo caliente.
          * En MODO_SILENCIO se apaga, para poder mirar el consumo. */
-        if (e.modo == MODO_SILENCIO) {
+        if (e.alarma) {
+            led_alarma_encendido = !led_alarma_encendido;
+
+            if (led_alarma_encendido) {
+                led(24, 0, 0);
+            } else {
+                led(0, 0, 0);
+            }
+        } else if (e.modo == MODO_SILENCIO) {
             ESP_ERROR_CHECK(led_strip_clear(s_led));
         } else if (e.media_x100 < 3000) {
             led(0, 0, 24);
@@ -758,6 +778,11 @@ void app_main(void)
 
     s_cola_eventos = xQueueCreate(COLA_EVENTOS_LARGO, sizeof(evento_t));
 
+    s_timer_parpadeo = xTimerCreate("parpadeo", pdMS_TO_TICKS(250), pdTRUE, NULL, 
+       callback_parpadeo
+    );
+
+    ESP_ERROR_CHECK(s_timer_parpadeo != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK((s_cola_muestras && s_cola_toques &&
                      s_mutex_estado && s_sem_arranque) ? ESP_OK : ESP_ERR_NO_MEM);
